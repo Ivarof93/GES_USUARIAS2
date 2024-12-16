@@ -1,0 +1,229 @@
+import pandas as pd
+from tkinter import Tk, filedialog
+from fuzzywuzzy import process  # Asegúrate de instalar fuzzywuzzy con `pip install fuzzywuzzy`
+from difflib import get_close_matches
+
+
+
+def cargar_archivos():
+    """Cargar el archivo Excel y el archivo BDUA"""
+    Tk().withdraw()
+
+    # Seleccionar archivo Excel de entrada
+    print("Selecciona el archivo Excel de entrada")
+    excel_input = filedialog.askopenfilename(filetypes=[("Archivos Excel", "*.xlsx")])
+
+    if not excel_input:
+        print("No se seleccionó ningún archivo de entrada.")
+        return None, None
+
+    # Seleccionar archivo BDUA (archivo de texto)
+    print("Selecciona el archivo BDUA (archivo .txt)")
+    bdua_file = filedialog.askopenfilename(filetypes=[("Archivos de texto", "*.txt")])
+
+    if not bdua_file:
+        print("No se seleccionó ningún archivo BDUA.")
+        return None, None
+
+    # Cargar el archivo Excel
+    df = pd.read_excel(excel_input)
+
+    # Intentar cargar el archivo BDUA.txt con diferentes codificaciones
+    try:
+        bdua = pd.read_csv(bdua_file, sep="\t")
+    except UnicodeDecodeError:
+        print("Error de codificación. Intentando con 'latin1'.")
+        bdua = pd.read_csv(bdua_file, sep="\t", encoding="latin1")
+
+    return df, bdua
+
+
+def corregir_zona(df):
+    """Corrige los valores en la columna '4 - Zona territorial de residencia'"""
+
+    def corregir_zona_func(zona):
+        if pd.isna(zona) or zona == "":
+            return "R"  # Si el valor es vacío, lo considera como "R" por defecto
+        zona = str(zona).lower()
+        if any(termino in zona for termino in ["r1", "r2", "r3", "rural", "ruural"]):
+            return "R"
+        elif "urbano" in zona or "u" in zona or "urb" in zona:
+            return "U"
+        else:
+            return zona.upper()  # Asegura que la zona quede en mayúsculas
+
+    # Aplicar corrección a la columna "4 - Zona territorial de residencia"
+    df["4 - Zona territorial de residencia"] = df["4 - Zona territorial de residencia"].apply(corregir_zona_func)
+
+
+def validar_municipios(df, bdua):
+    """Valida y corrige los municipios, cruzando con BDUA"""
+    # Crear una nueva columna para validar si el código de municipio es válido (suponiendo 5 dígitos)
+    df["Municipio_valido"] = df["3 - Municipío de residencia"].astype(str).str.match(r'^\d{5}$')
+
+    # Crear el código concatenado "CodDptoCodMpio" en BDUA
+    bdua["CodDptoCodMpio"] = bdua["CodDpto"].astype(str).str.zfill(2) + bdua["CodMpio"].astype(str).str.zfill(3)
+
+    # Paso 1: Cruce por número de documento
+    codigo_map = bdua.set_index("documento")["CodDptoCodMpio"].to_dict()
+    df.loc[~df["Municipio_valido"], "3 - Municipío de residencia"] = df[~df["Municipio_valido"]][
+        "7 - Número de identificación de la usuaria"].map(codigo_map)
+
+    # Revalidar códigos inválidos
+    df["Municipio_valido"] = df["3 - Municipío de residencia"].astype(str).str.match(r'^\d{5}$')
+
+    # Paso 2: Cruce por nombre de municipio (si quedan códigos inválidos)
+    if df[~df["Municipio_valido"]].shape[0] > 0:
+        print("Realizando cruce por nombres de municipios...")
+
+        # Lista de nombres de municipios únicos del BDUA
+        municipio_names = bdua["NomMpio"].unique()
+
+        # Buscar coincidencias fuzzy
+        def find_best_match(municipio_name):
+            match, score = process.extractOne(municipio_name, municipio_names)
+            return match if score >= 80 else None  # Umbral de similitud del 80%
+
+        # Buscar coincidencias fuzzy en los municipios restantes
+        invalid_indices = df[~df["Municipio_valido"]].index
+        for idx in invalid_indices:
+            municipio_name = str(df.at[idx, "3 - Municipío de residencia"])
+            best_match = find_best_match(municipio_name)
+            if best_match:
+                cod_dpto_cod_mpio = bdua.loc[bdua["NomMpio"] == best_match, "CodDptoCodMpio"].iloc[0]
+                df.at[idx, "3 - Municipío de residencia"] = cod_dpto_cod_mpio
+
+    # Revalidar códigos inválidos nuevamente
+    df["Municipio_valido"] = df["3 - Municipío de residencia"].astype(str).str.match(r'^\d{5}$')
+
+
+def actualizar_tipo_registro(df):
+    """Actualizar la columna '0 - Tipo de registro' con el valor '2'"""
+    df["0 - Tipo de registro"] = 2
+
+def corregir_tipo_identificacion(df):
+    """Corrige los valores en la columna '6 - Tipo de identificación de la usuaria'"""
+    valid_types = ["CC", "TI", "RC", "PE"]  # Tipos válidos
+
+    def corregir_tipo(tipo):
+        if pd.isna(tipo):  # Si el valor es NaN, retornar NaN sin cambios
+            return tipo
+        tipo = str(tipo).upper().replace(" ", "")  # Convertir a mayúsculas y eliminar espacios
+        if tipo in valid_types:
+            return tipo
+        else:
+            # Si no está en la lista de tipos válidos, retornar un valor vacío o "INDEFINIDO"
+            return "INDEFINIDO"
+
+    # Aplicar la corrección a la columna "6 - Tipo de identificación de la usuaria"
+    df["6 - Tipo de identificación de la usuaria"] = df["6 - Tipo de identificación de la usuaria"].apply(corregir_tipo)
+
+
+import re
+
+
+def corregir_nombres_apellidos(df, bdua):
+    """Corrige las columnas de apellidos y nombres según las reglas indicadas."""
+
+    def limpiar_nombre(nombre):
+        """Limpia un nombre o apellido eliminando números, caracteres especiales, tildes, y convirtiendo a mayúsculas."""
+        if pd.isna(nombre):  # Si el valor es NaN, retornar NaN sin cambios
+            return nombre
+        # Eliminar caracteres no alfabéticos
+        nombre = re.sub(r'[^a-zA-ZáéíóúÁÉÍÓÚ\s]', '', str(nombre))
+        # Eliminar tildes
+        nombre = nombre.translate(str.maketrans("áéíóúÁÉÍÓÚ", "aeiouAEIOU"))
+        # Eliminar espacios excesivos y convertir a mayúsculas
+        nombre = " ".join(nombre.split()).upper()
+        return nombre
+
+    # Limpiar todas las columnas de nombres y apellidos
+    df["8 - Primer apellido de la usuaria"] = df["8 - Primer apellido de la usuaria"].apply(limpiar_nombre)
+    df["9 - Segundo apellido de la usuaria"] = df["9 - Segundo apellido de la usuaria"].apply(limpiar_nombre)
+    df["10 - Primer nombre de la usuaria"] = df["10 - Primer nombre de la usuaria"].apply(limpiar_nombre)
+    df["11 - Segundo nombre de la usuaria"] = df["11 - Segundo nombre de la usuaria"].apply(limpiar_nombre)
+
+    # Revisar y completar los valores vacíos en el primer apellido o primer nombre
+    for idx, row in df.iterrows():
+        # Si el primer apellido está vacío, realizar el cruce con BDUA
+        if pd.isna(row["8 - Primer apellido de la usuaria"]) or row["8 - Primer apellido de la usuaria"] == "":
+            documento = row["7 - Número de identificación de la usuaria"]
+            apellido1_bdua = bdua.loc[bdua["documento"] == documento, "apellido1"].values
+            if apellido1_bdua:
+                df.at[idx, "8 - Primer apellido de la usuaria"] = apellido1_bdua[0]
+            else:
+                # Si no se encuentra, usar el segundo apellido como el primer apellido
+                df.at[idx, "8 - Primer apellido de la usuaria"] = row["9 - Segundo apellido de la usuaria"]
+
+        # Si el primer nombre está vacío, realizar el cruce con BDUA
+        if pd.isna(row["10 - Primer nombre de la usuaria"]) or row["10 - Primer nombre de la usuaria"] == "":
+            documento = row["7 - Número de identificación de la usuaria"]
+            nombre1_bdua = bdua.loc[bdua["documento"] == documento, "nombre1"].values
+            if nombre1_bdua:
+                df.at[idx, "10 - Primer nombre de la usuaria"] = nombre1_bdua[0]
+            else:
+                # Si no se encuentra en BDUA, mover el segundo nombre al primer nombre si está vacío
+                if pd.isna(row["10 - Primer nombre de la usuaria"]) or row["10 - Primer nombre de la usuaria"] == "":
+                    if pd.notna(row["11 - Segundo nombre de la usuaria"]) and row[
+                        "11 - Segundo nombre de la usuaria"] != "":
+                        df.at[idx, "10 - Primer nombre de la usuaria"] = row["11 - Segundo nombre de la usuaria"]
+                        df.at[idx, "11 - Segundo nombre de la usuaria"] = ""  # Limpiar el segundo nombre
+
+        # Evitar duplicar el primer nombre y el segundo nombre
+        if df.at[idx, "10 - Primer nombre de la usuaria"] == df.at[idx, "11 - Segundo nombre de la usuaria"]:
+            df.at[idx, "11 - Segundo nombre de la usuaria"] = ""
+
+    # Si el segundo apellido o segundo nombre está vacío después del cruce, aplicar la misma corrección (ajustar el primero con el segundo)
+    for idx, row in df.iterrows():
+        # Si el segundo apellido está vacío, ponerlo igual que el primer apellido
+        if pd.isna(row["9 - Segundo apellido de la usuaria"]) or row["9 - Segundo apellido de la usuaria"] == "":
+            df.at[idx, "9 - Segundo apellido de la usuaria"] = row["8 - Primer apellido de la usuaria"]
+
+        # Si el segundo nombre está vacío, ponerlo igual que el primer nombre
+        if pd.isna(row["11 - Segundo nombre de la usuaria"]) or row["11 - Segundo nombre de la usuaria"] == "":
+            df.at[idx, "11 - Segundo nombre de la usuaria"] = row["10 - Primer nombre de la usuaria"]
+
+    return df
+
+
+
+def agregar_consecutivo(df):
+    """Agregar números consecutivos en la columna '1 - Consecutivo de registro', iniciando en 1"""
+    df["1 - Consecutivo de registro"] = range(1, len(df) + 1)
+
+
+def guardar_archivo(df):
+    """Guardar el archivo actualizado"""
+    print("Selecciona la ubicación para guardar el archivo actualizado")
+    output_file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Archivos Excel", "*.xlsx")])
+
+    if not output_file:
+        print("No se seleccionó ninguna ubicación para guardar el archivo.")
+        return None
+
+    # Guardar el resultado
+    df.to_excel(output_file, index=False)
+    print(f"Proceso finalizado. Archivo guardado como: {output_file}")
+    return output_file
+
+
+def main():
+    # Cargar los archivos
+    df, bdua = cargar_archivos()
+    if df is None or bdua is None:
+        return
+
+    # Realizar las actualizaciones en las columnas específicas
+    corregir_zona(df)
+    validar_municipios(df, bdua)
+    actualizar_tipo_registro(df)
+    agregar_consecutivo(df)
+    corregir_nombres_apellidos(df, bdua)  # Nueva función añadida para los nombres y apellidos
+    corregir_codigo_ips(df)
+
+    # Guardar el archivo actualizado
+    guardar_archivo(df)
+
+
+if __name__ == "__main__":
+    main()
